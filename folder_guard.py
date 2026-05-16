@@ -10,6 +10,12 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
+try:
     import pystray
     from PIL import Image, ImageDraw
     TRAY_AVAILABLE = True
@@ -56,11 +62,15 @@ class FolderGuardApp:
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
-        self.root = ctk.CTk()
+        if DND_AVAILABLE:
+            self.root = TkinterDnD.Tk()
+            self.root.configure(bg="#f4f2fb")
+        else:
+            self.root = ctk.CTk()
+            self.root.configure(fg_color="#f4f2fb")
         self.root.title("FolderGuard")
         self.root.geometry("460x720")
         self.root.resizable(False, False)
-        self.root.configure(fg_color="#f4f2fb")
 
         # 헤더
         hdr = ctk.CTkFrame(self.root, fg_color=PURPLE, corner_radius=0, height=80)
@@ -91,15 +101,21 @@ class FolderGuardApp:
         pad.pack(fill="both", expand=True, padx=22, pady=16)
 
         # 폴더 추가 버튼
-        ctk.CTkButton(
-            pad, text="  +  보호할 폴더 선택하기",
-            font=ctk.CTkFont(size=15, weight="bold"),
+        self.drop_btn = ctk.CTkButton(
+            pad, text="  +  클릭해서 폴더 선택  |  여기에 폴더 끌어다 놓기",
+            font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=PURPLE_BG, text_color=PURPLE_LIGHT,
             hover_color="#e6e0ff",
             border_width=2, border_color=PURPLE_BORDER,
-            corner_radius=13, height=54,
+            corner_radius=13, height=60,
             command=self._add_folder
-        ).pack(fill="x", pady=(0, 14))
+        )
+        self.drop_btn.pack(fill="x", pady=(0, 14))
+
+        # 드래그 앤 드롭 설정
+        if DND_AVAILABLE:
+            self.drop_btn.drop_target_register(DND_FILES)
+            self.drop_btn.dnd_bind("<<Drop>>", self._on_drop)
 
         ctk.CTkLabel(pad, text="보호 중인 폴더",
                      font=ctk.CTkFont(size=12, weight="bold"),
@@ -223,6 +239,31 @@ class FolderGuardApp:
                        corner_radius=8, font=ctk.CTkFont(size=12, weight="bold"),
                        command=lambda i=idx: self._remove(i)).pack()
 
+    def _on_drop(self, event):
+        """드래그 앤 드롭으로 폴더 추가"""
+        raw = event.data.strip()
+        # 여러 개 드롭 처리: {} 로 감싸진 경우와 공백 구분 처리
+        if raw.startswith("{"):
+            paths = [p.strip("{}") for p in raw.split("} {")]
+        else:
+            paths = raw.split()
+
+        added = 0
+        for path in paths:
+            path = os.path.normpath(path.strip('"'))
+            if os.path.isdir(path):
+                if not any(f["path"] == path for f in self.folders):
+                    self.folders.append({
+                        "path": path,
+                        "original_name": os.path.basename(path),
+                        "protected": False,
+                        "pinned": False,
+                    })
+                    added += 1
+        if added:
+            self._save()
+            self._refresh()
+
     def _add_folder(self):
         path = filedialog.askdirectory(title="보호할 폴더를 선택하세요")
         if not path:
@@ -290,7 +331,7 @@ class FolderGuardApp:
     def _protect(self, path):
         try:
             user = os.environ.get("USERNAME", "")
-            r = subprocess.run(["icacls", path, "/deny", f"{user}:(D,DC)"],
+            r = subprocess.run(["icacls", path, "/deny", f"{user}:(DE,AD)"],
                                capture_output=True, text=True)
             return r.returncode == 0
         except Exception as e:
@@ -356,5 +397,37 @@ class FolderGuardApp:
         self.root.destroy()
 
 
+import tempfile
+import atexit
+
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "folderguard.lock")
+
+def is_already_running():
+    """이미 실행 중인지 확인 — 락 파일 방식"""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            # 해당 PID가 실제로 살아있는지 확인
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True  # 살아있음 → 이미 실행 중
+        except Exception:
+            pass
+    # 락 파일 생성
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.remove(LOCK_FILE) if os.path.exists(LOCK_FILE) else None)
+    return False
+
 if __name__ == "__main__":
-    FolderGuardApp()
+    if is_already_running():
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("FolderGuard", "FolderGuard가 이미 실행 중이에요!\n트레이 아이콘을 확인해주세요.")
+        root.destroy()
+    else:
+        FolderGuardApp()
