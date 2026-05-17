@@ -331,7 +331,7 @@ class FolderGuardApp:
     def _protect(self, path):
         try:
             user = os.environ.get("USERNAME", "")
-            r = subprocess.run(["icacls", path, "/deny", f"{user}:(DE,AD)"],
+            r = subprocess.run(["icacls", path, "/deny", f"{user}:(D,DC)"],
                                capture_output=True, text=True)
             return r.returncode == 0
         except Exception as e:
