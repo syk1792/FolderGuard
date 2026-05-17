@@ -6,6 +6,8 @@ import os
 import json
 import threading
 import subprocess
+import ctypes
+import ctypes.wintypes
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
@@ -40,6 +42,7 @@ class FolderGuardApp:
     def __init__(self):
         self.folders = []
         self.tray_icon = None
+        self._handles = {}  # 폴더 핸들 저장 {path: handle}
         self._load()
         self._build_ui()
 
@@ -329,21 +332,43 @@ class FolderGuardApp:
         self._refresh()
 
     def _protect(self, path):
+        """폴더 핸들을 열어두어 삭제 방지 — 권한 변경 없이 가장 확실한 방법"""
         try:
-            user = os.environ.get("USERNAME", "")
-            r = subprocess.run(["icacls", path, "/deny", f"{user}:(D,DC)"],
-                               capture_output=True, text=True)
-            return r.returncode == 0
+            if path in self._handles:
+                return True  # 이미 보호 중
+
+            GENERIC_READ          = 0x80000000
+            FILE_SHARE_READ       = 0x00000001
+            FILE_SHARE_WRITE      = 0x00000002
+            FILE_SHARE_DELETE     = 0x00000004
+            FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+            OPEN_EXISTING         = 3
+
+            handle = ctypes.windll.kernel32.CreateFileW(
+                path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,  # DELETE 공유 안 함 → 삭제 차단
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None
+            )
+
+            INVALID_HANDLE = ctypes.wintypes.HANDLE(-1).value
+            if handle == INVALID_HANDLE:
+                raise Exception("폴더 핸들을 열 수 없어요.")
+
+            self._handles[path] = handle
+            return True
         except Exception as e:
             messagebox.showerror("오류", f"보호 적용 실패:\n{e}")
             return False
 
     def _unprotect(self, path):
-        try:
-            user = os.environ.get("USERNAME", "")
-            subprocess.run(["icacls", path, "/remove:d", user], capture_output=True, text=True)
-        except Exception:
-            pass
+        """핸들 닫기 — 보호 해제"""
+        handle = self._handles.pop(path, None)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
 
     def _pin(self, path):
         parent, name = os.path.dirname(path), os.path.basename(path)
@@ -392,6 +417,10 @@ class FolderGuardApp:
             self._quit()
 
     def _quit(self, *_):
+        # 모든 핸들 닫기
+        for handle in self._handles.values():
+            ctypes.windll.kernel32.CloseHandle(handle)
+        self._handles.clear()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.destroy()
