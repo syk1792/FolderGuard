@@ -142,7 +142,7 @@ class FolderGuardApp:
         opt_row.columnconfigure((0, 1, 2), weight=1)
 
         self._opt_card(opt_row, "삭제 방지",  "실수로\n못 지우게",   self.opt_delete, 0)
-        self._opt_card(opt_row, "상단 고정",  "탐색기\n맨 위 표시", self.opt_pin,    1)
+        self._opt_card(opt_row, "즐겨찾기 고정", "탐색기 왼쪽\n즐겨찾기 추가", self.opt_pin,    1)
         self._opt_card(opt_row, "트레이 상주","백그라운드\n보호",    self.opt_tray,   2)
 
         btn_row = ctk.CTkFrame(pad, fg_color="transparent")
@@ -293,10 +293,8 @@ class FolderGuardApp:
                 if self._protect(path):
                     folder["protected"] = True
             if self.opt_pin.get() and not folder.get("pinned"):
-                new = self._pin(path)
-                if new != path:
-                    folder["path"] = new
-                    folder["pinned"] = True
+                self._pin(path)
+                folder["pinned"] = True
             done += 1
         self._save()
         self._refresh()
@@ -371,25 +369,25 @@ class FolderGuardApp:
             ctypes.windll.kernel32.CloseHandle(handle)
 
     def _pin(self, path):
-        parent, name = os.path.dirname(path), os.path.basename(path)
-        if not name.startswith(PIN_PREFIX):
-            new_path = os.path.join(parent, PIN_PREFIX + name)
-            try:
-                os.rename(path, new_path)
-                return new_path
-            except Exception:
-                pass
-        return path
+        """탐색기 즐겨찾기(빠른 액세스)에 폴더 고정"""
+        try:
+            import ctypes
+            shell = ctypes.windll.shell32
+            # SHAddToRecentDocs로 빠른 액세스에 추가
+            # 더 확실한 방법: PowerShell로 즐겨찾기 고정
+            ps_cmd = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\"{path}\"); $s.Self.InvokeVerb(\"pintohome\")"'
+            result = subprocess.run(ps_cmd, capture_output=True, shell=True)
+            return path
+        except Exception:
+            return path
 
     def _unpin(self, path):
-        parent, name = os.path.dirname(path), os.path.basename(path)
-        if name.startswith(PIN_PREFIX):
-            new_path = os.path.join(parent, name[len(PIN_PREFIX):])
-            try:
-                os.rename(path, new_path)
-                return new_path
-            except Exception:
-                pass
+        """탐색기 즐겨찾기에서 폴더 제거"""
+        try:
+            ps_cmd = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\"{path}\"); $s.Self.InvokeVerb(\"unpinfromhome\")"'
+            subprocess.run(ps_cmd, capture_output=True, shell=True)
+        except Exception:
+            pass
         return path
 
     def _start_tray(self):
