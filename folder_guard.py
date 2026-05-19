@@ -1,21 +1,26 @@
 """
-FolderGuard - 폴더 실수 삭제 방지 프로그램
+FolderGuard v2.0 - 완성본
+- 핸들 방식 삭제 방지
+- 탐색기 즐겨찾기 고정
+- 트레이 상주
+- 중복 실행 방지
+- 드래그 앤 드롭
+- 부팅 시 자동 실행
+- PC 재시작 후에도 자동 보호 복구
 """
 
 import os
+import sys
 import json
 import threading
 import subprocess
 import ctypes
 import ctypes.wintypes
+import tempfile
+import atexit
+import winreg
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
 
 try:
     import pystray
@@ -24,8 +29,17 @@ try:
 except ImportError:
     TRAY_AVAILABLE = False
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
+# ── 상수 ──────────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".folderguard.json")
-PIN_PREFIX    = "! "
+LOCK_FILE     = os.path.join(tempfile.gettempdir(), "folderguard.lock")
+APP_NAME      = "FolderGuard"
+REG_KEY       = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 PURPLE        = "#5a46b4"
 PURPLE_LIGHT  = "#7c6ee6"
@@ -38,14 +52,34 @@ GREEN         = "#22c55e"
 WHITE         = "#ffffff"
 
 
+# ── 중복 실행 방지 ────────────────────────────────────
+def is_already_running():
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+        except Exception:
+            pass
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.remove(LOCK_FILE) if os.path.exists(LOCK_FILE) else None)
+    return False
+
+
 class FolderGuardApp:
     def __init__(self):
-        self.folders = []
+        self.folders  = []
         self.tray_icon = None
-        self._handles = {}  # 폴더 핸들 저장 {path: handle}
+        self._handles  = {}
         self._load()
+        self._restore_protection()  # PC 재시작 후 자동 보호 복구
         self._build_ui()
 
+    # ── 저장/불러오기 ─────────────────────────────────
     def _load(self):
         try:
             if os.path.exists(SETTINGS_FILE):
@@ -61,6 +95,40 @@ class FolderGuardApp:
         except Exception:
             pass
 
+    # ── PC 재시작 후 보호 자동 복구 ───────────────────
+    def _restore_protection(self):
+        for folder in self.folders:
+            if folder.get("protected") and os.path.exists(folder["path"]):
+                self._protect(folder["path"])
+            if folder.get("pinned") and os.path.exists(folder["path"]):
+                self._pin(folder["path"])
+
+    # ── 부팅 자동 실행 ────────────────────────────────
+    def _set_autostart(self, enable: bool):
+        try:
+            exe = sys.executable if not getattr(sys, 'frozen', False) else sys.executable
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_SET_VALUE)
+            if enable:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+    def _get_autostart(self) -> bool:
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except Exception:
+            return False
+
+    # ── UI ────────────────────────────────────────────
     def _build_ui(self):
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
@@ -71,35 +139,45 @@ class FolderGuardApp:
         else:
             self.root = ctk.CTk()
             self.root.configure(fg_color="#f4f2fb")
-        self.root.title("FolderGuard")
-        self.root.geometry("460x720")
+
+        self.root.title(APP_NAME)
+        self.root.geometry("460x760")
         self.root.resizable(False, False)
 
-        # 헤더
+        self._make_header()
+        self._make_body()
+        self._make_statusbar()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._refresh()
+
+        # 트레이 자동 시작 (보호 중인 폴더 있으면)
+        if any(f.get("protected") for f in self.folders) and TRAY_AVAILABLE:
+            self._start_tray()
+
+        self.root.mainloop()
+
+    def _make_header(self):
         hdr = ctk.CTkFrame(self.root, fg_color=PURPLE, corner_radius=0, height=80)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-
-        hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
-        hdr_inner.pack(fill="both", expand=True, padx=22, pady=14)
-
-        icon_box = ctk.CTkFrame(hdr_inner, fg_color="#7259c9", corner_radius=13, width=50, height=50)
+        row = ctk.CTkFrame(hdr, fg_color="transparent")
+        row.pack(fill="both", expand=True, padx=22, pady=14)
+        icon_box = ctk.CTkFrame(row, fg_color="#7259c9", corner_radius=13, width=50, height=50)
         icon_box.pack(side="left")
         icon_box.pack_propagate(False)
         ctk.CTkLabel(icon_box, text="FG", font=ctk.CTkFont(size=16, weight="bold"),
                      text_color=WHITE).place(relx=0.5, rely=0.5, anchor="center")
-
-        txt_box = ctk.CTkFrame(hdr_inner, fg_color="transparent")
-        txt_box.pack(side="left", padx=14)
-        ctk.CTkLabel(txt_box, text="FolderGuard",
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", padx=14)
+        ctk.CTkLabel(txt, text="FolderGuard",
                      font=ctk.CTkFont(size=20, weight="bold"), text_color=WHITE).pack(anchor="w")
-        ctk.CTkLabel(txt_box, text="소중한 폴더를 실수로부터 보호해요",
+        ctk.CTkLabel(txt, text="소중한 폴더를 실수로부터 보호해요",
                      font=ctk.CTkFont(size=12), text_color="#c5bcf0").pack(anchor="w")
 
-        # 본문
+    def _make_body(self):
         body = ctk.CTkFrame(self.root, fg_color=WHITE, corner_radius=0)
         body.pack(fill="both", expand=True)
-
         pad = ctk.CTkFrame(body, fg_color="transparent")
         pad.pack(fill="both", expand=True, padx=22, pady=16)
 
@@ -108,14 +186,10 @@ class FolderGuardApp:
             pad, text="  +  클릭해서 폴더 선택  |  여기에 폴더 끌어다 놓기",
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=PURPLE_BG, text_color=PURPLE_LIGHT,
-            hover_color="#e6e0ff",
-            border_width=2, border_color=PURPLE_BORDER,
-            corner_radius=13, height=60,
-            command=self._add_folder
-        )
+            hover_color="#e6e0ff", border_width=2, border_color=PURPLE_BORDER,
+            corner_radius=13, height=58, command=self._add_folder)
         self.drop_btn.pack(fill="x", pady=(0, 14))
 
-        # 드래그 앤 드롭 설정
         if DND_AVAILABLE:
             self.drop_btn.drop_target_register(DND_FILES)
             self.drop_btn.dnd_bind("<<Drop>>", self._on_drop)
@@ -124,7 +198,7 @@ class FolderGuardApp:
                      font=ctk.CTkFont(size=12, weight="bold"),
                      text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 6))
 
-        self.list_frame = ctk.CTkScrollableFrame(pad, fg_color="transparent", height=190)
+        self.list_frame = ctk.CTkScrollableFrame(pad, fg_color="transparent", height=200)
         self.list_frame.pack(fill="x", pady=(0, 10))
 
         ctk.CTkFrame(pad, fg_color=PURPLE_BORDER, height=1).pack(fill="x", pady=(0, 10))
@@ -133,71 +207,62 @@ class FolderGuardApp:
                      font=ctk.CTkFont(size=12, weight="bold"),
                      text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 8))
 
-        self.opt_delete = ctk.BooleanVar(value=True)
-        self.opt_pin    = ctk.BooleanVar(value=True)
-        self.opt_tray   = ctk.BooleanVar(value=True)
+        self.opt_delete   = ctk.BooleanVar(value=True)
+        self.opt_pin      = ctk.BooleanVar(value=True)
+        self.opt_tray     = ctk.BooleanVar(value=True)
+        self.opt_autostart = ctk.BooleanVar(value=self._get_autostart())
 
         opt_row = ctk.CTkFrame(pad, fg_color="transparent")
-        opt_row.pack(fill="x", pady=(0, 14))
-        opt_row.columnconfigure((0, 1, 2), weight=1)
+        opt_row.pack(fill="x", pady=(0, 10))
+        opt_row.columnconfigure((0,1,2,3), weight=1)
 
-        self._opt_card(opt_row, "삭제 방지",  "실수로\n못 지우게",   self.opt_delete, 0)
-        self._opt_card(opt_row, "즐겨찾기 고정", "탐색기 왼쪽\n즐겨찾기 추가", self.opt_pin,    1)
-        self._opt_card(opt_row, "트레이 상주","백그라운드\n보호",    self.opt_tray,   2)
+        self._opt_card(opt_row, "삭제 방지",   "실수로\n못 지우게",      self.opt_delete,   0)
+        self._opt_card(opt_row, "즐겨찾기",    "탐색기 왼쪽\n고정",      self.opt_pin,      1)
+        self._opt_card(opt_row, "트레이 상주", "백그라운드\n보호",        self.opt_tray,     2)
+        self._opt_card(opt_row, "자동 실행",   "PC 켤 때\n자동 시작",    self.opt_autostart, 3)
 
         btn_row = ctk.CTkFrame(pad, fg_color="transparent")
         btn_row.pack(fill="x")
-        btn_row.columnconfigure((0, 1), weight=1)
+        btn_row.columnconfigure((0,1), weight=1)
 
-        ctk.CTkButton(
-            btn_row, text="보호 해제",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color=PURPLE_BG, text_color=PURPLE_LIGHT,
-            hover_color="#e6e0ff",
-            border_width=2, border_color=PURPLE_BORDER,
-            corner_radius=12, height=50,
-            command=self._release_all
-        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        ctk.CTkButton(btn_row, text="보호 해제",
+                      font=ctk.CTkFont(size=15, weight="bold"),
+                      fg_color=PURPLE_BG, text_color=PURPLE_LIGHT,
+                      hover_color="#e6e0ff", border_width=2, border_color=PURPLE_BORDER,
+                      corner_radius=12, height=50, command=self._release_all
+                      ).grid(row=0, column=0, padx=(0,6), sticky="ew")
 
-        ctk.CTkButton(
-            btn_row, text="✓  적용하기",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color=PURPLE, hover_color="#4a3494",
-            corner_radius=12, height=50,
-            command=self._apply
-        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
-
-        # 상태바
-        bar = ctk.CTkFrame(self.root, fg_color=PURPLE_BG, corner_radius=0, height=40)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-
-        bar_inner = ctk.CTkFrame(bar, fg_color="transparent")
-        bar_inner.pack(fill="both", expand=True, padx=22)
-
-        self.status_lbl = ctk.CTkLabel(bar_inner, text="● 보호 중인 폴더 없음",
-                                        font=ctk.CTkFont(size=13), text_color=TEXT_MID)
-        self.status_lbl.pack(side="left", pady=10)
-
-        ctk.CTkLabel(bar_inner, text="v1.0", font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED).pack(side="right", pady=10)
-
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._refresh()
-        self.root.mainloop()
+        ctk.CTkButton(btn_row, text="✓  적용하기",
+                      font=ctk.CTkFont(size=15, weight="bold"),
+                      fg_color=PURPLE, hover_color="#4a3494",
+                      corner_radius=12, height=50, command=self._apply
+                      ).grid(row=0, column=1, padx=(6,0), sticky="ew")
 
     def _opt_card(self, parent, title, desc, var, col):
         frame = ctk.CTkFrame(parent, fg_color=PURPLE_BG, corner_radius=12,
                              border_width=2, border_color=PURPLE_BORDER)
-        frame.grid(row=0, column=col, padx=4, sticky="nsew")
+        frame.grid(row=0, column=col, padx=3, sticky="nsew")
         ctk.CTkCheckBox(frame, text="", variable=var, width=20,
                          fg_color=PURPLE_LIGHT, hover_color=PURPLE,
-                         checkmark_color=WHITE, border_color=PURPLE_BORDER).pack(pady=(12, 4))
-        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(size=13, weight="bold"),
+                         checkmark_color=WHITE, border_color=PURPLE_BORDER).pack(pady=(10,4))
+        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(size=12, weight="bold"),
                      text_color="#4a3d8a", justify="center").pack()
-        ctk.CTkLabel(frame, text=desc, font=ctk.CTkFont(size=11),
-                     text_color=TEXT_MUTED, justify="center").pack(pady=(2, 12))
+        ctk.CTkLabel(frame, text=desc, font=ctk.CTkFont(size=10),
+                     text_color=TEXT_MUTED, justify="center").pack(pady=(2,10))
 
+    def _make_statusbar(self):
+        bar = ctk.CTkFrame(self.root, fg_color=PURPLE_BG, corner_radius=0, height=40)
+        bar.pack(fill="x", side="bottom")
+        bar.pack_propagate(False)
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=22)
+        self.status_lbl = ctk.CTkLabel(inner, text="● 보호 중인 폴더 없음",
+                                        font=ctk.CTkFont(size=13), text_color=TEXT_MID)
+        self.status_lbl.pack(side="left", pady=10)
+        ctk.CTkLabel(inner, text="v2.0", font=ctk.CTkFont(size=11),
+                     text_color=TEXT_MUTED).pack(side="right", pady=10)
+
+    # ── 목록 갱신 ─────────────────────────────────────
     def _refresh(self):
         for w in self.list_frame.winfo_children():
             w.destroy()
@@ -211,8 +276,7 @@ class FolderGuardApp:
                 self._folder_card(folder, i)
         count = sum(1 for f in self.folders if f.get("protected"))
         self.status_lbl.configure(
-            text=f"● {count}개 폴더 보호 중입니다" if count else "● 보호 중인 폴더 없음"
-        )
+            text=f"● {count}개 폴더 보호 중입니다" if count else "● 보호 중인 폴더 없음")
 
     def _folder_card(self, folder, idx):
         card = ctk.CTkFrame(self.list_frame, fg_color=PURPLE_BG, corner_radius=12,
@@ -220,7 +284,6 @@ class FolderGuardApp:
         card.pack(fill="x", pady=4)
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=10)
-
         info = ctk.CTkFrame(row, fg_color="transparent")
         info.pack(side="left", fill="x", expand=True)
         name = os.path.basename(folder["path"])
@@ -229,43 +292,29 @@ class FolderGuardApp:
                      text_color=TEXT_DARK, anchor="w").pack(anchor="w")
         ctk.CTkLabel(info, text=folder["path"],
                      font=ctk.CTkFont(size=10), text_color=TEXT_MUTED, anchor="w").pack(anchor="w")
-
         right = ctk.CTkFrame(row, fg_color="transparent")
-        right.pack(side="right", padx=(8, 0))
+        right.pack(side="right", padx=(8,0))
         if folder.get("protected"):
-            ctk.CTkLabel(right, text="보호중",
+            ctk.CTkLabel(right, text="● 보호중",
                          font=ctk.CTkFont(size=11, weight="bold"),
-                         text_color=GREEN).pack(pady=(0, 4))
+                         text_color=GREEN).pack(pady=(0,4))
         ctk.CTkButton(right, text="X", width=32, height=32,
                        fg_color=WHITE, text_color="#c4b8e8",
                        hover_color="#ffe4e4", border_width=1, border_color=PURPLE_BORDER,
                        corner_radius=8, font=ctk.CTkFont(size=12, weight="bold"),
                        command=lambda i=idx: self._remove(i)).pack()
 
+    # ── 액션 ──────────────────────────────────────────
     def _on_drop(self, event):
-        """드래그 앤 드롭으로 폴더 추가"""
         raw = event.data.strip()
-        # 여러 개 드롭 처리: {} 로 감싸진 경우와 공백 구분 처리
-        if raw.startswith("{"):
-            paths = [p.strip("{}") for p in raw.split("} {")]
-        else:
-            paths = raw.split()
-
-        added = 0
+        paths = [p.strip("{}") for p in raw.split("} {")] if raw.startswith("{") else raw.split()
         for path in paths:
             path = os.path.normpath(path.strip('"'))
-            if os.path.isdir(path):
-                if not any(f["path"] == path for f in self.folders):
-                    self.folders.append({
-                        "path": path,
-                        "original_name": os.path.basename(path),
-                        "protected": False,
-                        "pinned": False,
-                    })
-                    added += 1
-        if added:
-            self._save()
-            self._refresh()
+            if os.path.isdir(path) and not any(f["path"] == path for f in self.folders):
+                self.folders.append({"path": path, "original_name": os.path.basename(path),
+                                     "protected": False, "pinned": False})
+        self._save()
+        self._refresh()
 
     def _add_folder(self):
         path = filedialog.askdirectory(title="보호할 폴더를 선택하세요")
@@ -296,6 +345,8 @@ class FolderGuardApp:
                 self._pin(path)
                 folder["pinned"] = True
             done += 1
+        # 부팅 자동 실행 설정
+        self._set_autostart(self.opt_autostart.get())
         self._save()
         self._refresh()
         if self.opt_tray.get() and TRAY_AVAILABLE:
@@ -313,7 +364,7 @@ class FolderGuardApp:
                 self._unprotect(folder["path"])
                 folder["protected"] = False
             if folder.get("pinned"):
-                folder["path"] = self._unpin(folder["path"])
+                self._unpin(folder["path"])
                 folder["pinned"] = False
         self._save()
         self._refresh()
@@ -329,33 +380,23 @@ class FolderGuardApp:
         self._save()
         self._refresh()
 
+    # ── 보호 (핸들 방식) ──────────────────────────────
     def _protect(self, path):
-        """폴더 핸들을 열어두어 삭제 방지 — 권한 변경 없이 가장 확실한 방법"""
         try:
             if path in self._handles:
-                return True  # 이미 보호 중
-
-            GENERIC_READ          = 0x80000000
-            FILE_SHARE_READ       = 0x00000001
-            FILE_SHARE_WRITE      = 0x00000002
-            FILE_SHARE_DELETE     = 0x00000004
+                return True
+            GENERIC_READ               = 0x80000000
+            FILE_SHARE_READ            = 0x00000001
+            FILE_SHARE_WRITE           = 0x00000002
             FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-            OPEN_EXISTING         = 3
-
+            OPEN_EXISTING              = 3
             handle = ctypes.windll.kernel32.CreateFileW(
-                path,
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,  # DELETE 공유 안 함 → 삭제 차단
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                None
-            )
-
+                path, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, None)
             INVALID_HANDLE = ctypes.wintypes.HANDLE(-1).value
             if handle == INVALID_HANDLE:
-                raise Exception("폴더 핸들을 열 수 없어요.")
-
+                raise Exception("핸들을 열 수 없어요.")
             self._handles[path] = handle
             return True
         except Exception as e:
@@ -363,33 +404,28 @@ class FolderGuardApp:
             return False
 
     def _unprotect(self, path):
-        """핸들 닫기 — 보호 해제"""
         handle = self._handles.pop(path, None)
         if handle:
             ctypes.windll.kernel32.CloseHandle(handle)
 
+    # ── 즐겨찾기 고정 ─────────────────────────────────
     def _pin(self, path):
-        """탐색기 즐겨찾기(빠른 액세스)에 폴더 고정"""
         try:
-            import ctypes
-            shell = ctypes.windll.shell32
-            # SHAddToRecentDocs로 빠른 액세스에 추가
-            # 더 확실한 방법: PowerShell로 즐겨찾기 고정
-            ps_cmd = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\"{path}\"); $s.Self.InvokeVerb(\"pintohome\")"'
-            result = subprocess.run(ps_cmd, capture_output=True, shell=True)
-            return path
-        except Exception:
-            return path
-
-    def _unpin(self, path):
-        """탐색기 즐겨찾기에서 폴더 제거"""
-        try:
-            ps_cmd = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\"{path}\"); $s.Self.InvokeVerb(\"unpinfromhome\")"'
-            subprocess.run(ps_cmd, capture_output=True, shell=True)
+            ps = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\\"{path}\\"); $s.Self.InvokeVerb(\\"pintohome\\")"'
+            subprocess.run(ps, capture_output=True, shell=True)
         except Exception:
             pass
         return path
 
+    def _unpin(self, path):
+        try:
+            ps = f'powershell -WindowStyle Hidden -Command "$s=(New-Object -Com Shell.Application).NameSpace(\\"{path}\\"); $s.Self.InvokeVerb(\\"unpinfromhome\\")"'
+            subprocess.run(ps, capture_output=True, shell=True)
+        except Exception:
+            pass
+        return path
+
+    # ── 트레이 ────────────────────────────────────────
     def _start_tray(self):
         if self.tray_icon or not TRAY_AVAILABLE:
             return
@@ -399,9 +435,8 @@ class FolderGuardApp:
         menu = pystray.Menu(
             pystray.MenuItem("FolderGuard 열기", self._show_window, default=True),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("종료", self._quit),
-        )
-        self.tray_icon = pystray.Icon("FolderGuard", img, "FolderGuard 실행 중", menu)
+            pystray.MenuItem("종료", self._quit))
+        self.tray_icon = pystray.Icon(APP_NAME, img, f"{APP_NAME} 실행 중", menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _show_window(self, *_):
@@ -415,7 +450,6 @@ class FolderGuardApp:
             self._quit()
 
     def _quit(self, *_):
-        # 모든 핸들 닫기
         for handle in self._handles.values():
             ctypes.windll.kernel32.CloseHandle(handle)
         self._handles.clear()
@@ -424,37 +458,12 @@ class FolderGuardApp:
         self.root.destroy()
 
 
-import tempfile
-import atexit
-
-LOCK_FILE = os.path.join(tempfile.gettempdir(), "folderguard.lock")
-
-def is_already_running():
-    """이미 실행 중인지 확인 — 락 파일 방식"""
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, 'r') as f:
-                pid = int(f.read().strip())
-            # 해당 PID가 실제로 살아있는지 확인
-            import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True  # 살아있음 → 이미 실행 중
-        except Exception:
-            pass
-    # 락 파일 생성
-    with open(LOCK_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    atexit.register(lambda: os.remove(LOCK_FILE) if os.path.exists(LOCK_FILE) else None)
-    return False
-
 if __name__ == "__main__":
     if is_already_running():
         import tkinter as tk
         root = tk.Tk()
         root.withdraw()
-        messagebox.showinfo("FolderGuard", "FolderGuard가 이미 실행 중이에요!\n트레이 아이콘을 확인해주세요.")
+        messagebox.showinfo(APP_NAME, "FolderGuard가 이미 실행 중이에요!\n트레이 아이콘을 확인해주세요.")
         root.destroy()
     else:
         FolderGuardApp()
