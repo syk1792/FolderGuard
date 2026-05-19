@@ -207,19 +207,16 @@ class FolderGuardApp:
                      font=ctk.CTkFont(size=12, weight="bold"),
                      text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 8))
 
-        self.opt_delete   = ctk.BooleanVar(value=True)
-        self.opt_pin      = ctk.BooleanVar(value=True)
-        self.opt_tray     = ctk.BooleanVar(value=True)
-        self.opt_autostart = ctk.BooleanVar(value=self._get_autostart())
+        self.opt_delete = ctk.BooleanVar(value=True)
+        self.opt_pin    = ctk.BooleanVar(value=True)
+        # 트레이 상주, 자동 실행은 항상 켜짐 (기본값)
 
         opt_row = ctk.CTkFrame(pad, fg_color="transparent")
         opt_row.pack(fill="x", pady=(0, 10))
-        opt_row.columnconfigure((0,1,2,3), weight=1)
+        opt_row.columnconfigure((0,1), weight=1)
 
-        self._opt_card(opt_row, "삭제 방지",   "실수로\n못 지우게",      self.opt_delete,   0)
-        self._opt_card(opt_row, "즐겨찾기",    "탐색기 왼쪽\n고정",      self.opt_pin,      1)
-        self._opt_card(opt_row, "트레이 상주", "백그라운드\n보호",        self.opt_tray,     2)
-        self._opt_card(opt_row, "자동 실행",   "PC 켤 때\n자동 시작",    self.opt_autostart, 3)
+        self._opt_card(opt_row, "삭제 방지", "실수로\n못 지우게",   self.opt_delete, 0)
+        self._opt_card(opt_row, "즐겨찾기",  "탐색기 왼쪽\n고정", self.opt_pin,    1)
 
         btn_row = ctk.CTkFrame(pad, fg_color="transparent")
         btn_row.pack(fill="x")
@@ -345,12 +342,11 @@ class FolderGuardApp:
                 self._pin(path)
                 folder["pinned"] = True
             done += 1
-        # 부팅 자동 실행 설정
-        self._set_autostart(self.opt_autostart.get())
+        self._set_autostart(True)   # 항상 자동 실행 등록
         self._save()
         self._refresh()
-        if self.opt_tray.get() and TRAY_AVAILABLE:
-            self._start_tray()
+        if TRAY_AVAILABLE:
+            self._start_tray()          # 항상 트레이 상주
         messagebox.showinfo("완료", f"{done}개 폴더에 보호를 적용했어요!")
 
     def _release_all(self):
@@ -443,7 +439,7 @@ class FolderGuardApp:
         self.root.after(0, lambda: (self.root.deiconify(), self.root.lift()))
 
     def _on_close(self):
-        if self.opt_tray.get() and TRAY_AVAILABLE:
+        if TRAY_AVAILABLE:
             self.root.withdraw()
             self._start_tray()
         else:
